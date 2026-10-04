@@ -163,10 +163,8 @@ static int KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	const auto dialog                  = Dialog::SystemDialog::GetVisualState();
-	*status                            = SystemServiceStatus();
-	status->is_system_ui_overlaid      = dialog.active;
-	status->is_in_background_execution = dialog.background;
+	*status                      = SystemServiceStatus();
+	status->is_system_ui_overlaid = Dialog::ErrorDialog::GetVisualState().active;
 
 	return OK;
 }

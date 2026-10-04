@@ -28,11 +28,8 @@ public:
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
 
-	void                      SetGlobalSettings(const QStringList& dirs);
+	void                      SetGameDirectories(const QStringList& dirs);
 	[[nodiscard]] QStringList GetGameDirectories() const;
-
-signals:
-	void PreviewControllerColor(const QString& color);
 
 private:
 	Ui::ConfigurationEditDialog* m_ui = nullptr;
@@ -40,7 +37,7 @@ private:
 	QGroupBox*                   m_game_dirs_group        = nullptr;
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
-	bool                         m_global_settings        = false;
+	bool                         m_show_game_dirs         = false;
 
 protected:
 	void Init(const Configuration& info);

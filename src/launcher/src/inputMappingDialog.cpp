@@ -53,9 +53,6 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"Options", "Options", "Return"},
     {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
     {"TouchPadRight", "Touch pad right (START)", "Tab"},
-    {"SpeakerVolume", "Speaker volume (cycle)", "1"},
-    {"VibrationIntensity", "Vibration intensity (cycle)", "2"},
-    {"TriggerEffectIntensity", "Trigger effect intensity (cycle)", "3"},
 };
 
 QString KeypadName(int key) {
