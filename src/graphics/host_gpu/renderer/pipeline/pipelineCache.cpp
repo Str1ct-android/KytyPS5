@@ -1389,7 +1389,7 @@ void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationR
 			result.valid = true;
 		}
 	};
-	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 13u) - 1u;
+	const auto threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u) - 1u;
 	{
 		std::vector<std::jthread> helpers;
 		for (uint32_t i = 1; i < threads; i++) {

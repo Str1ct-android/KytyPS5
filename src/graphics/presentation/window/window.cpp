@@ -307,20 +307,14 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
-		}
+		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
-		}
+		Controller::Disconnect(f.id);
+		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
 	}
 
 	if (f.down || f.up) {
@@ -363,13 +357,11 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
-void WindowContext::Resize(int new_width, int new_height) {
-	if (new_width <= 0 || new_height <= 0) {
-		return;
-	}
+void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
+	EXIT_IF(new_width == 0 || new_height == 0);
 	Common::LockGuard lock(mutex);
-	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
-	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
+	graphic_ctx.screen_width  = new_width;
+	graphic_ctx.screen_height = new_height;
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
