@@ -48,7 +48,6 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(xbyak zydis)
-target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
 
 # ZArchive provides random-access reads for compressed game dumps. Build only
 # the reader/writer library and its zstd dependency; the command-line tool is
