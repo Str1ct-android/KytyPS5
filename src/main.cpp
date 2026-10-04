@@ -3,6 +3,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/settingsFile.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -12,6 +13,7 @@
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <fmt/format.h>
@@ -43,6 +45,8 @@ static std::string GetBuildString() {
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
+	::printf("Options can also be set in kyty_settings.ini in the working directory, one per\n"
+	         "line without \"--\" (e.g. gpu-timestamp-scale = 115). The command line overrides it.\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
@@ -58,6 +62,8 @@ static void PrintUsage() {
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	::printf("  --bda-sync <value>                   Selective, Legacy, or SelectiveChecked. "
+	         "Default: Selective.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -71,6 +77,8 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
+	::printf("  --shader-precompile <true|false>     Replay recorded shaders before drawing. "
+	         "Default: true.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -85,6 +93,31 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --drain-stats <seconds>              Report GPU waits by cause every N seconds.\n");
+	::printf("  --dcc-gpu-clear <true|false>         Apply GPU-written DCC clears on the GPU. "
+	         "Default: true.\n");
+	::printf("  --async-submit <true|false>          Submit GPU work from a dedicated queue thread. "
+	         "Default: true.\n");
+	::printf("  --gpu-mesh-indirect <true|false>     Build mesh-emulated indirect draws on the GPU. "
+	         "Default: true.\n");
+	::printf("  --gpu-frames-ahead <0-3>             Frames the game may build ahead of the GPU "
+	         "thread. 0 waits for idle. Default: 0.\n");
+	::printf("  --label-flush-interval-us <us>       Minimum time between RELEASE_MEM submits. "
+	         "Default: 2000.\n");
+	::printf("  --gpu-timestamp-scale <100-200>      Stretch GPU time the game measures, in "
+	         "percent, so dynamic resolution keeps headroom. Default: 100 (off).\n");
+	::printf("  --pipeline-libraries <true|false>    Build new graphics pipelines from cached, "
+	         "separately compiled parts where the driver supports it. Default: true.\n");
+	::printf("  --async-pipelines <true|false>       Skip draws whose new pipeline is still "
+	         "compiling instead of stalling; they appear a few frames late. Default: false.\n");
+	::printf("  --relaxed-readback <true|false>      Let game threads read memory the GPU is still "
+	         "writing without waiting; a value can be a frame old. Default: false.\n");
+	::printf("  --speculative-draws <true|false>     Prepare draws' shader resources on a second "
+	         "thread ahead of the GPU thread. Default: true.\n");
+	::printf("  --record-thread <true|false>         Record the GPU thread's Vulkan commands on the "
+	         "submit thread. Default: true.\n");
+	::printf("  --hardware-buffer-bounds <true|false> Let the GPU check shader buffer ranges where "
+	         "it supports that, instead of checks compiled into each shader. Default: true.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -350,6 +383,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--bda-sync") {
+			if (!ParseEnum(value, options.config.bda_sync_mode)) {
+				::printf("invalid BDA synchronization mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -377,6 +415,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-validation") {
 			if (!ParseBool(value, options.config.shader_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--shader-precompile") {
+			if (!ParseBool(value, options.config.shader_precompile_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
@@ -416,6 +459,84 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--drain-stats") {
+			uint32_t interval = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), interval);
+			if (error != std::errc {} || end != value.data() + value.size() || interval > 3600) {
+				::printf("invalid drain-stats interval: %s\n", value.c_str());
+				return false;
+			}
+			options.config.drain_stats_interval = interval;
+		} else if (arg == "--label-flush-interval-us") {
+			uint32_t interval = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), interval);
+			if (error != std::errc {} || end != value.data() + value.size() || interval > 100000) {
+				::printf("invalid label-flush-interval-us: %s\n", value.c_str());
+				return false;
+			}
+			options.config.label_flush_interval_us = interval;
+		} else if (arg == "--gpu-frames-ahead") {
+			uint32_t frames = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), frames);
+			if (error != std::errc {} || end != value.data() + value.size() || frames > 3) {
+				::printf("invalid gpu-frames-ahead (0-3): %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_frames_ahead = frames;
+		} else if (arg == "--dcc-gpu-clear") {
+			if (!ParseBool(value, options.config.dcc_gpu_clear_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-mesh-indirect") {
+			if (!ParseBool(value, options.config.gpu_mesh_indirect_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-timestamp-scale") {
+			uint32_t percent = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), percent);
+			if (error != std::errc {} || end != value.data() + value.size() || percent < 100 ||
+			    percent > 200) {
+				::printf("invalid gpu-timestamp-scale (100-200): %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_timestamp_scale_percent = percent;
+		} else if (arg == "--pipeline-libraries") {
+			if (!ParseBool(value, options.config.pipeline_libraries_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--async-pipelines") {
+			if (!ParseBool(value, options.config.async_pipelines_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--speculative-draws") {
+			if (!ParseBool(value, options.config.speculative_draws_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--record-thread") {
+			if (!ParseBool(value, options.config.record_thread_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--hardware-buffer-bounds") {
+			if (!ParseBool(value, options.config.hardware_buffer_bounds)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--relaxed-readback") {
+			if (!ParseBool(value, options.config.relaxed_readback_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--async-submit") {
+			if (!ParseBool(value, options.config.async_submit_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -448,10 +569,27 @@ static int Main(int argc, char* argv[]) {
 	RunOptions options;
 	bool       show_help = false;
 
-	if (argc < 2) {
+	std::vector<std::string> settings;
+	if (!SettingsFile::LoadArguments(settings)) {
+		return 1;
+	}
+	if (!settings.empty()) {
+		::printf("Settings: %s\n", SettingsFile::FileName);
+	}
+
+	if (argc < 2 && settings.empty()) {
 		PrintUsage();
 		return 0;
 	}
+
+	// The settings file's options go first, so the same option on the command line overrides it.
+	std::vector<char*> arguments {argv[0]};
+	for (auto& setting: settings) {
+		arguments.push_back(setting.data());
+	}
+	arguments.insert(arguments.end(), argv + 1, argv + argc);
+	argc = static_cast<int>(arguments.size());
+	argv = arguments.data();
 
 	if (!ParseArgs(argc, argv, options, show_help)) {
 		PrintUsage();

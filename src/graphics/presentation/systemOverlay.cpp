@@ -3,6 +3,8 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/settingsFile.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <span>
@@ -29,9 +32,9 @@ namespace Libs::Graphics {
 
 namespace {
 
-namespace CoreIme      = Libs::Ime;
-namespace DialogIme    = Libs::Dialog::ImeDialog;
-namespace SystemDialog = Libs::Dialog::SystemDialog;
+namespace CoreIme   = Libs::Ime;
+namespace DialogIme = Libs::Dialog::ImeDialog;
+namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
 
@@ -104,7 +107,12 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Dialog };
+enum class OverlayKind : uint8_t { None, Ime, Error, Settings };
+
+// The emulator settings panel, toggled with F2. The generation changes on every open and close,
+// so each opening is a new session and the presenter redraws when it closes.
+std::atomic<bool>     g_settings_open {false};
+std::atomic<uint64_t> g_settings_generation {0};
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -114,18 +122,23 @@ struct OverlaySession {
 };
 
 struct OverlaySnapshot {
-	OverlaySession             session;
-	Ime::HostSnapshot          ime;
-	SystemDialog::HostSnapshot dialog;
+	OverlaySession            session;
+	Ime::HostSnapshot         ime;
+	ErrorDialog::HostSnapshot error;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
-	if (SystemDialog::GetHostSnapshot(&snapshot->dialog)) {
-		snapshot->session = {OverlayKind::Dialog, snapshot->dialog.generation};
+	if (ErrorDialog::GetHostSnapshot(&snapshot->error)) {
+		snapshot->session = {OverlayKind::Error, snapshot->error.generation};
 		return true;
 	}
 	if (Ime::GetHostSnapshot(&snapshot->ime)) {
 		snapshot->session = {OverlayKind::Ime, snapshot->ime.generation};
+		return true;
+	}
+	if (g_settings_open.load(std::memory_order_acquire)) {
+		snapshot->session = {OverlayKind::Settings,
+		                     g_settings_generation.load(std::memory_order_acquire)};
 		return true;
 	}
 	snapshot->session = {};
@@ -140,7 +153,8 @@ enum class InputKind : uint8_t {
 	MousePosition,
 	MouseButton,
 	MouseWheel,
-	ResetController
+	ResetController,
+	Key // A keyboard navigation key for the settings panel; id is the ImGuiKey.
 };
 
 struct InputEvent {
@@ -234,7 +248,8 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Dialog) {
+	if (snapshot.session.kind == OverlayKind::Error ||
+	    snapshot.session.kind == OverlayKind::Settings) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -258,6 +273,15 @@ void RefreshVisibility() {
 			g_missing_visibility_wakeups++;
 		}
 	}
+}
+
+void SetSettingsOpen(bool open) {
+	if (g_settings_open.load(std::memory_order_acquire) == open) {
+		return;
+	}
+	g_settings_generation.fetch_add(1, std::memory_order_acq_rel);
+	g_settings_open.store(open, std::memory_order_release);
+	RefreshVisibility();
 }
 
 void OnCoreVisibilityChanged(bool, uint64_t) {
@@ -429,14 +453,15 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
-	SystemDialog::SetVisibilityCallback(RefreshVisibility);
+	ErrorDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
+	std::printf("Emulator settings: press F2 in the game window.\n");
 }
 
 void ShutdownSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
-	SystemDialog::SetVisibilityCallback(nullptr);
+	ErrorDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -466,9 +491,11 @@ void ShutdownSystemOverlayInput() {
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
-	const auto system = SystemDialog::GetVisualState();
-	return {core.active || dialog.active || system.active,
-	        core.revision + dialog.revision + system.revision};
+	const auto error  = ErrorDialog::GetVisualState();
+	return {core.active || dialog.active || error.active ||
+	            g_settings_open.load(std::memory_order_acquire),
+	        core.revision + dialog.revision + error.revision +
+	            g_settings_generation.load(std::memory_order_acquire)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -504,6 +531,12 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		}
 		return false;
 	}
+	// F2 opens and closes the emulator settings panel, unless a game dialog owns the overlay.
+	if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F2 &&
+	    g_input_session.kind != OverlayKind::Ime && g_input_session.kind != OverlayKind::Error) {
+		SetSettingsOpen(!g_settings_open.load(std::memory_order_acquire));
+		return true;
+	}
 	if (!g_input_active) {
 		return false;
 	}
@@ -521,11 +554,36 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
 	}
-	if (keyboard_event && session.kind == OverlayKind::Dialog) {
+	if (keyboard_event && session.kind == OverlayKind::Settings) {
 		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
-		     event.key.key == SDLK_ESCAPE)) {
-			SystemDialog::HostClose(generation);
+		    event.key.key == SDLK_ESCAPE) {
+			SetSettingsOpen(false);
+			return true;
+		}
+		if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+			ImGuiKey key = ImGuiKey_None;
+			switch (event.key.key) {
+				case SDLK_LEFT: key = ImGuiKey_LeftArrow; break;
+				case SDLK_RIGHT: key = ImGuiKey_RightArrow; break;
+				case SDLK_UP: key = ImGuiKey_UpArrow; break;
+				case SDLK_DOWN: key = ImGuiKey_DownArrow; break;
+				case SDLK_TAB: key = ImGuiKey_Tab; break;
+				case SDLK_SPACE: key = ImGuiKey_Space; break;
+				case SDLK_RETURN:
+				case SDLK_KP_ENTER: key = ImGuiKey_Enter; break;
+				default: break;
+			}
+			if (key != ImGuiKey_None) {
+				QueueInput({InputKind::Key, session, static_cast<int>(key),
+				            event.type == SDL_EVENT_KEY_DOWN ? 1.0f : 0.0f, 0.0f});
+			}
+		}
+		return true;
+	}
+	if (keyboard_event && session.kind == OverlayKind::Error) {
+		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)) {
+			ErrorDialog::HostAccept(generation);
 		}
 		return true;
 	}
@@ -620,7 +678,7 @@ struct SystemOverlay::Impl {
 		auto& io       = ImGui::GetIO();
 		io.IniFilename = nullptr;
 		io.LogFilename = nullptr;
-		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
@@ -690,6 +748,9 @@ struct SystemOverlay::Impl {
 						} else if (event.id == SDL_GAMEPAD_BUTTON_NORTH) {
 							Ime::HostBackspace(session.generation);
 						}
+					} else if (session.kind == OverlayKind::Settings && down &&
+					           event.id == SDL_GAMEPAD_BUTTON_EAST) {
+						SetSettingsOpen(false);
 					}
 					const ImGuiKey key = ControllerButtonToKey(event.id);
 					if (key != ImGuiKey_None) {
@@ -726,6 +787,9 @@ struct SystemOverlay::Impl {
 					break;
 				}
 				case InputKind::MouseWheel: io.AddMouseWheelEvent(event.x, event.y); break;
+				case InputKind::Key:
+					io.AddKeyEvent(static_cast<ImGuiKey>(event.id), event.x != 0.0f);
+					break;
 				case InputKind::ResetController:
 					io.ClearEventsQueue();
 					io.ClearInputKeys();
@@ -905,7 +969,7 @@ struct SystemOverlay::Impl {
 		ImGui::End();
 	}
 
-	void DrawDialog(const SystemDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+	void DrawError(const ErrorDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
 		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
@@ -923,23 +987,17 @@ struct SystemOverlay::Impl {
 		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
-		const bool                 signin = snapshot.kind == SystemDialog::Kind::Signin;
-		ImGui::Begin("##SystemDialog", nullptr, flags);
-		ImGui::TextUnformatted(signin ? "Sign in to PlayStation Network" : "Error");
+		ImGui::Begin("##SystemError", nullptr, flags);
+		ImGui::TextUnformatted("Error");
 		ImGui::Separator();
 		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", signin ? "PlayStation Network sign-in is unavailable."
-		                         : error_code == 0x80550006u
+		ImGui::TextWrapped("%s", error_code == 0x80550006u
 		                             ? "You are not signed in to PlayStation Network."
 		                             : "An error has occurred.");
-		if (!signin) {
-			ImGui::TextDisabled("Error code: 0x%08X", error_code);
-		}
+		ImGui::TextDisabled("Error code: 0x%08X", error_code);
 		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);
 		ImGui::SetCursorPosX((ImGui::GetWindowSize().x - button_width) * 0.5f);
-		const bool accepted =
-		    ImGui::Button(signin ? "Cancel" : "OK", {button_width, 44.0f * scale}) ||
-		    (signin && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false));
+		const bool accepted = ImGui::Button("OK", {button_width, 44.0f * scale});
 		if (focus_pending) {
 			ImGui::SetItemDefaultFocus();
 			focus_pending = false;
@@ -948,7 +1006,181 @@ struct SystemOverlay::Impl {
 		ImGui::PopFont();
 		ImGui::PopStyleVar(2);
 		if (accepted) {
-			SystemDialog::HostClose(snapshot.generation);
+			ErrorDialog::HostAccept(snapshot.generation);
+		}
+	}
+
+	void DrawSettings(vk::Extent2D extent) {
+		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+		const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.75f);
+		ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display,
+		                                              IM_COL32(0, 0, 0, 120));
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always,
+		                        {0.5f, 0.5f});
+		ImGui::SetNextWindowSize(
+		    {std::max(std::min(600.0f * scale, display.x - 32.0f), 1.0f), 0.0f}, ImGuiCond_Always);
+		if (focus_pending) {
+			ImGui::SetNextWindowFocus();
+			settings_saved_percent = static_cast<int>(Config::GetGpuTimestampScalePercent());
+			settings_save_failed   = false;
+		}
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 20.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 12.0f * scale});
+		ImGui::PushFont(nullptr, 18.0f * scale);
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_AlwaysAutoResize;
+		ImGui::Begin("##KytySettings", nullptr, flags);
+		ImGui::TextUnformatted("Emulator settings");
+		ImGui::Separator();
+
+		ImGui::TextUnformatted("Dynamic resolution headroom");
+		int percent = static_cast<int>(Config::GetGpuTimestampScalePercent());
+		ImGui::SetNextItemWidth(-1.0f);
+		bool changed = ImGui::SliderInt("##headroom", &percent, 100, 150,
+		                                percent == 100 ? "Off" : "%d%%",
+		                                ImGuiSliderFlags_AlwaysClamp);
+		if (changed) {
+			percent = (percent + 2) / 5 * 5;
+		}
+		// Left/right (keys or d-pad) step the focused slider without activating it first.
+		if (ImGui::IsItemFocused() && !ImGui::IsItemActive()) {
+			if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) ||
+			    ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft)) {
+				percent = std::max(percent - 5, 100);
+				changed = true;
+			} else if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) ||
+			           ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight)) {
+				percent = std::min(percent + 5, 150);
+				changed = true;
+			}
+		}
+		if (changed) {
+			Config::SetGpuTimestampScalePercent(static_cast<uint32_t>(percent));
+		}
+		if (focus_pending) {
+			ImGui::SetItemDefaultFocus();
+			focus_pending = false;
+		}
+		// Saved once the slider is released, not on every step of a drag.
+		if (percent != settings_saved_percent && !ImGui::IsItemActive()) {
+			settings_save_failed   = !Common::SettingsFile::Save("gpu-timestamp-scale",
+			                                                     std::to_string(percent));
+			settings_saved_percent = percent;
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "For games that adjust their render resolution to how busy the GPU is, such as Astro "
+		    "Bot. Higher values keep GPU time in reserve: a steadier frame rate at a lower "
+		    "resolution. Astro Bot holds a steady 60 from 115%%.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		bool libraries = Config::PipelineLibrariesEnabled();
+		if (ImGui::Checkbox("Pipeline libraries", &libraries)) {
+			Config::SetPipelineLibrariesEnabled(libraries);
+			settings_save_failed = !Common::SettingsFile::Save("pipeline-libraries",
+			                                                   libraries ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Builds new graphics pipelines from separately compiled parts that later pipelines "
+		    "reuse, so effects seen for the first time stall the game for less time. Applies to "
+		    "pipelines built from now on, on GPU drivers with fast pipeline-library linking.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		bool async_pipelines = Config::AsyncPipelinesEnabled();
+		if (ImGui::Checkbox("Asynchronous pipelines", &async_pipelines)) {
+			Config::SetAsyncPipelinesEnabled(async_pipelines);
+			settings_save_failed = !Common::SettingsFile::Save("async-pipelines",
+			                                                   async_pipelines ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Instead of stalling the game while a new graphics pipeline compiles, skips the "
+		    "draws that need it until it is ready, so objects and effects seen for the first time "
+		    "appear a few frames late. Needs pipeline libraries.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		bool relaxed_readback = Config::RelaxedReadbackEnabled();
+		if (ImGui::Checkbox("Relaxed GPU readback", &relaxed_readback)) {
+			Config::SetRelaxedReadbackEnabled(relaxed_readback);
+			settings_save_failed = !Common::SettingsFile::Save("relaxed-readback",
+			                                                   relaxed_readback ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "When the game reads memory the GPU is still writing, it gets the previous value at "
+		    "once instead of waiting for the GPU, so GPU-heavy scenes stall less. A value the game "
+		    "reads can then be one frame old.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		bool speculative_draws = Config::SpeculativeDrawsEnabled();
+		if (ImGui::Checkbox("Prepare draws ahead", &speculative_draws)) {
+			Config::SetSpeculativeDrawsEnabled(speculative_draws);
+			settings_save_failed = !Common::SettingsFile::Save(
+			    "speculative-draws", speculative_draws ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "A second CPU thread prepares upcoming draws' shader resources while the render thread "
+		    "works, so scenes with many draws run faster. The render thread checks each prepared "
+		    "draw and prepares it itself when anything changed. Uses one more CPU core.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		if (record_thread_choice < 0) {
+			record_thread_choice = Config::RecordThreadEnabled() ? 1 : 0;
+		}
+		bool record_thread = record_thread_choice != 0;
+		if (ImGui::Checkbox("Record commands on a second thread", &record_thread)) {
+			record_thread_choice = record_thread ? 1 : 0;
+			settings_save_failed =
+			    !Common::SettingsFile::Save("record-thread", record_thread ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "The render thread hands its Vulkan commands to a second CPU thread, which records and "
+		    "submits them, so scenes with many draws run faster. Uses one more CPU core. Applies "
+		    "at the next start.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+
+		if (hardware_bounds_choice < 0) {
+			hardware_bounds_choice = Config::HardwareBufferBoundsEnabled() ? 1 : 0;
+		}
+		bool hardware_bounds = hardware_bounds_choice != 0;
+		if (ImGui::Checkbox("GPU checks shader buffer ranges", &hardware_bounds)) {
+			hardware_bounds_choice = hardware_bounds ? 1 : 0;
+			settings_save_failed = !Common::SettingsFile::Save(
+			    "hardware-buffer-bounds", hardware_bounds ? "true" : "false");
+		}
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled(
+		    "Shaders leave their buffer range checks to the GPU where it supports that, which "
+		    "saves GPU time in shader-heavy scenes. Turn off only to compare. Applies at the next "
+		    "start.");
+		ImGui::PopTextWrapPos();
+		ImGui::Separator();
+		if (settings_save_failed) {
+			ImGui::TextColored({1.0f, 0.5f, 0.4f, 1.0f}, "Could not save %s",
+			                   Common::SettingsFile::FileName);
+		} else {
+			ImGui::TextDisabled("Applies immediately; saved to %s.",
+			                    Common::SettingsFile::FileName);
+		}
+		const float button_width = std::min(160.0f * scale, ImGui::GetContentRegionAvail().x);
+		ImGui::SetCursorPosX(ImGui::GetWindowSize().x - button_width -
+		                     ImGui::GetStyle().WindowPadding.x);
+		const bool close = ImGui::Button("Close (F2)", {button_width, 36.0f * scale});
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleVar(2);
+		if (close) {
+			SetSettingsOpen(false);
 		}
 	}
 
@@ -962,8 +1194,7 @@ struct SystemOverlay::Impl {
 		if (session != snapshot.session) {
 			session       = snapshot.session;
 			focus_pending = true;
-			shift         = session.kind == OverlayKind::Ime &&
-			                (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
 			symbol_mode   = false;
 			panel_offset  = {};
 			right_stick   = {};
@@ -989,8 +1220,10 @@ struct SystemOverlay::Impl {
 			ImGui::EndFrame();
 			return false;
 		}
-		if (snapshot.session.kind == OverlayKind::Dialog) {
-			DrawDialog(snapshot.dialog, frame_extent);
+		if (snapshot.session.kind == OverlayKind::Error) {
+			DrawError(snapshot.error, frame_extent);
+		} else if (snapshot.session.kind == OverlayKind::Settings) {
+			DrawSettings(frame_extent);
 		} else {
 			DrawIme(snapshot.ime, frame_extent);
 		}
@@ -1038,6 +1271,10 @@ struct SystemOverlay::Impl {
 	bool                                  focus_pending      = true;
 	float                                 ui_scale           = 1.0f;
 	float                                 button_height      = 42.0f;
+	int                                   settings_saved_percent = 100;
+	bool                                  settings_save_failed   = false;
+	int                                   record_thread_choice   = -1;
+	int                                   hardware_bounds_choice = -1;
 	ImVec2                                panel_offset {};
 	ImVec2                                right_stick {};
 	OverlaySession                        session;

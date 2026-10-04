@@ -25,8 +25,6 @@ struct ControlInfo {
 	Controller::Axis axis     = Controller::Axis::AxisMax;
 	bool             positive = false;
 	float            touch_x  = 0.0f;
-
-	Controller::Setting setting {};
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -57,10 +55,6 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"RightStickRight", 0, Controller::Axis::RightX, true},
     ControlInfo {"RightStickUp", 0, Controller::Axis::RightY, false},
     ControlInfo {"RightStickDown", 0, Controller::Axis::RightY, true},
-    ControlInfo {.name = "SpeakerVolume", .setting = Controller::Setting::SpeakerVolume},
-    ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
-    ControlInfo {.name    = "TriggerEffectIntensity",
-                 .setting = Controller::Setting::TriggerEffectIntensity},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -72,7 +66,6 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
-constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -82,8 +75,7 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
-SDL_Window*        g_mouse_window   = nullptr;
-uint64_t           g_cursor_hide_at = 0;
+SDL_Window*        g_mouse_window = nullptr;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -146,7 +138,8 @@ public:
 			}
 
 			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
+			                      binding.key == SDLK_F2 || binding.key == SDLK_F7 ||
+			                      binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -250,12 +243,6 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
-void CycleSettingOnPress(Controller::Setting setting, bool down) {
-	if (down) {
-		Controller::CycleSetting(setting);
-	}
-}
-
 void SetControl(std::size_t control, bool down) {
 	if (control == INVALID_CONTROL) {
 		return;
@@ -268,10 +255,6 @@ void SetControl(std::size_t control, bool down) {
 	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
-		return;
-	}
-	if (info.axis == Controller::Axis::AxisMax) {
-		CycleSettingOnPress(info.setting, down);
 		return;
 	}
 
@@ -298,9 +281,6 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
-		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
-		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
-		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
 		case SDLK_A:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
@@ -382,31 +362,11 @@ int PollMouse(uint64_t now_ms) {
 	return MOUSE_POLL_INTERVAL_MS;
 }
 
-bool IsCursorActivity(const SDL_Event& event) {
-	SDL_MouseID which;
-	switch (event.type) {
-		case SDL_EVENT_MOUSE_MOTION:
-			if (event.motion.xrel == 0.0f && event.motion.yrel == 0.0f) {
-				return false;
-			}
-			which = event.motion.which;
-			break;
-		case SDL_EVENT_MOUSE_BUTTON_DOWN:
-		case SDL_EVENT_MOUSE_BUTTON_UP: which = event.button.which; break;
-		case SDL_EVENT_MOUSE_WHEEL: which = event.wheel.which; break;
-		default: return false;
-	}
-	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
-}
-
 } // namespace
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
-	if (Config::HideCursorEnabled()) {
-		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
-	}
 }
 
 void HostInputShutdown() {
@@ -415,11 +375,7 @@ void HostInputShutdown() {
 		CenterMouseStick();
 		g_mouse = {};
 	}
-	g_mouse_window   = nullptr;
-	g_cursor_hide_at = 0;
-	if (Config::HideCursorEnabled()) {
-		SDL_ShowCursor();
-	}
+	g_mouse_window = nullptr;
 }
 
 void HostInputKey(int key_code, bool down) {
@@ -455,7 +411,12 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event) {
-	int timeout = -1;
+	// Return periodically so the main loop pumps events, and with them queued main-thread
+	// callbacks, even if a wakeup is missed. A presentation thread may be blocked on one of
+	// those callbacks (for example a window-title update). Half a vblank, at least 1 ms.
+	const int main_task_poll_ms = std::max(
+	    1, static_cast<int>(1000u / (2u * std::max(Config::GetVblankFrequency(), 1u))));
+	int timeout_ms = main_task_poll_ms;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
@@ -464,28 +425,10 @@ bool HostInputWaitEvent(SDL_Event* event) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		timeout = PollMouse(SDL_GetTicks());
+		timeout_ms = std::min(PollMouse(SDL_GetTicks()), main_task_poll_ms);
 	}
-
-	if (g_cursor_hide_at != 0) {
-		const auto now_ms = SDL_GetTicks();
-		const int  cursor_timeout =
-		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
-		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
-	}
-	const bool has_event = SDL_WaitEventTimeout(event, timeout);
-
-	if (Config::HideCursorEnabled()) {
-		const auto now_ms = SDL_GetTicks();
-		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
-		    SDL_GetWindowFromEvent(event) == g_mouse_window) {
-			SDL_ShowCursor();
-			g_cursor_hide_at = now_ms + CURSOR_IDLE_HIDE_MS;
-		} else if (g_cursor_hide_at != 0 && now_ms >= g_cursor_hide_at) {
-			SDL_HideCursor();
-			g_cursor_hide_at = 0;
-		}
-	}
+	// SDL3 reports a timeout as false and has no separate error result for this call.
+	const bool has_event = SDL_WaitEventTimeout(event, timeout_ms);
 
 	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
 	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {

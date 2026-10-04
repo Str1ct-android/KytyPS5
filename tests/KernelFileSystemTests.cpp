@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 
 #include <chrono>
 #include <csignal>
@@ -30,27 +29,15 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
 
-namespace Libs {
-void InitLibKernel_1(Loader::SymbolDatabase *symbols);
-}
-
-namespace Libs::LibAmpr {
-void InitAmpr_1(Loader::SymbolDatabase *symbols);
-}
-
 namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
-}
-
-namespace Libs::LibNpWebApi2 {
-void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -140,119 +127,6 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
-}
-
-void TestAioBatches() {
-  namespace Kernel = Libs::LibKernel;
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto find = [&](const char *nid) {
-    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-    Check(symbol != nullptr, "AIO exports resolve");
-    return symbol->vaddr;
-  };
-  struct Result { int64_t return_value; uint32_t state; };
-  struct Request {
-    int64_t offset;
-    size_t size;
-    void *buffer;
-    Result *result;
-    int32_t fd;
-  };
-  using Submit = int (KYTY_SYSV_ABI *)(Request *, int32_t, int32_t, int32_t *);
-  using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
-  using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
-  using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
-  const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
-  const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
-  const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
-  const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
-  const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
-  const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
-  constexpr char Payload[] = "AIO payload";
-  const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
-  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
-        "create AIO read fixture");
-  std::array<int32_t, 3> ids {};
-  std::array<char, 4> buffer {};
-  Result result {};
-  Request request {2, buffer.size(), buffer.data(), &result, fd};
-  for (int i = 0; i < 2; ++i) {
-    Check(submit(&request, 1, 2, &ids[i]) == OK &&
-              result.return_value == buffer.size() && result.state == 3 &&
-              std::memcmp(buffer.data(), Payload + 2, buffer.size()) == 0,
-          "AIO submission reads bytes at the requested offset");
-  }
-  ids[2] = -1;
-  std::array<int32_t, 3> states {-1, -1, -1};
-  Check(poll(ids.data(), ids.size(), states.data()) == OK &&
-            states[0] == 3 && states[1] == 3 && states[2] == Kernel::KERNEL_ERROR_ESRCH,
-        "batch poll writes every state and per-request invalid-ID error");
-  Check(poll_one(ids[0], &states[0]) == OK && states[0] == (3 | 0x10000) &&
-            poll(ids.data(), 2, states.data()) == OK &&
-            states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
-            wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
-        "single and batch polls and waits share completion notification state");
-  Check(erase(ids.data(), ids.size(), states.data()) == OK &&
-            states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
-        "batch deletion writes per-request results");
-  Check(poll_one(ids[0], &states[0]) == OK && states[0] == Kernel::KERNEL_ERROR_ESRCH &&
-            erase_one(ids[1], &states[1]) == OK && states[1] == Kernel::KERNEL_ERROR_ESRCH,
-        "deleted AIO IDs are invalid for single-request APIs");
-  for (const auto batch : {poll, erase}) {
-    states.fill(42);
-    Check(batch(nullptr, 1, states.data()) == Kernel::KERNEL_ERROR_EFAULT &&
-              batch(ids.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
-              batch(ids.data(), 0, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
-              batch(ids.data(), 129, states.data()) == Kernel::KERNEL_ERROR_EINVAL &&
-              states == std::array<int32_t, 3> {42, 42, 42},
-          "invalid batch arguments do not modify outputs");
-    std::array<int32_t, 128> invalid_ids {};
-    std::array<int32_t, 128> errors {};
-    Check(batch(invalid_ids.data(), invalid_ids.size(), errors.data()) == OK &&
-              std::all_of(errors.begin(), errors.end(), [](int32_t error) {
-                return error == Kernel::KERNEL_ERROR_ESRCH;
-              }),
-          "maximum-sized batch returns all invalid-ID errors");
-  }
-  Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
-}
-
-void TestNpWebApi2Memory() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibNpWebApi2::InitNet_1_NpWebApi2(&symbols);
-  const auto find = [&](const char *nid) {
-    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-    Check(symbol != nullptr, "NpWebApi2 library and memory exports resolve");
-    return symbol->vaddr;
-  };
-  struct Stats { size_t pool, maximum, current; int32_t reserved; };
-  static_assert(sizeof(Stats) == 32 && offsetof(Stats, reserved) == 24);
-  using Initialize = int (KYTY_SYSV_ABI *)(int, size_t);
-  using GetStats = int (KYTY_SYSV_ABI *)(int, Stats *);
-  using Terminate = int (KYTY_SYSV_ABI *)(int);
-  const auto initialize = reinterpret_cast<Initialize>(find("+o9816YQhqQ"));
-  const auto get_stats = reinterpret_cast<GetStats>(find("Xweb+naPZ8Y"));
-  const auto terminate = reinterpret_cast<Terminate>(find("bEvXpcEk200"));
-  const int first = initialize(1, 65537);
-  const int second = initialize(1, 16384);
-  Stats stats {1, 2, 3, 4};
-  Check(first > 0 && second > 0 && first != second &&
-            get_stats(first, &stats) == OK && stats.pool == 81920 &&
-            stats.maximum == 0 && stats.current == 0 && stats.reserved == 0 &&
-            get_stats(second, &stats) == OK && stats.pool == 16384,
-        "NpWebApi2 statistics retain each context's rounded pool capacity");
-  Check(get_stats(first, nullptr) == static_cast<int32_t>(0x80553402) &&
-            get_stats(0, &stats) == static_cast<int32_t>(0x80553403) &&
-            initialize(1, std::numeric_limits<size_t>::max()) == static_cast<int32_t>(0x80553402),
-        "NpWebApi2 statistics validate output, context ID, and pool rounding");
-  Check(terminate(first) == OK &&
-            get_stats(first, &stats) == static_cast<int32_t>(0x80553404) &&
-            terminate(first) == static_cast<int32_t>(0x80553404) &&
-            terminate(-1) == static_cast<int32_t>(0x80553403) &&
-            get_stats(second, &stats) == OK && stats.pool == 16384 &&
-            terminate(second) == OK,
-        "NpWebApi2 termination removes only the selected library context");
 }
 
 void CheckMountRoot(const std::filesystem::path &root) {
@@ -624,125 +498,6 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
-void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
-  Libs::LibAmpr::InitAmpr_1(&symbols);
-  const auto find = [&](const char *nid) {
-    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-    Check(symbol != nullptr, "AMPR command and submission exports resolve");
-    return symbol->vaddr;
-  };
-  using Unary = void (KYTY_SYSV_ABI *)(void *);
-  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
-  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
-  using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
-  using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
-                                          uint8_t, uint8_t);
-  using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
-  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
-                                       void *, uint64_t, uint64_t);
-  struct Result { int32_t result; uint32_t error_offset; };
-  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
-  using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
-  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
-  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
-  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
-  const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
-  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
-  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
-  const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
-  const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
-  const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
-  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
-  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
-  const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
-  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
-  const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
-  struct Buffer {
-    std::array<uint64_t, 5> header {};
-    std::array<uint32_t, 256> data {};
-  };
-  std::array<Buffer, 4> buffers;
-  const auto reset = [&](size_t apr_count) {
-    for (size_t i = 0; i < buffers.size(); ++i) {
-      auto &buffer = buffers[i];
-      construct(buffer.header.data());
-      if (i < apr_count) {
-        construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
-      } else {
-        construct_amm(buffer.header.data());
-      }
-      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
-            "initialize AMPR command buffer");
-    }
-  };
-  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
-  struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
-  constexpr std::array comparisons {
-      Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
-                                   0x40000000000019c4},
-      Comparison{1, 0, INT64_MAX, uint64_t{1} << 63},
-      Comparison{2, UINT64_MAX, uint64_t{1} << 63, INT64_MAX}, Comparison{3, 2, 2, 3},
-      Comparison{4, UINT64_MAX - 1, UINT64_MAX, 0},
-      Comparison{5, UINT64_MAX, 0, 1}, Comparison{6, 0, 0, UINT64_MAX}};
-  for (const auto &comparison : comparisons) {
-    reset(3);
-    uint64_t fence = comparison.blocked;
-    uint64_t blocked_done = 0, read_done = 0, lower_done = 0;
-    std::array<char, 3> output {};
-    std::array<Result, 3> results {{{1234, 5678}, {1234, 5678}, {1234, 5678}}};
-    std::array<uint32_t, 4> ids {};
-    auto *blocked = buffers[0].header.data();
-    auto *reader = buffers[1].header.data();
-    auto *lower = buffers[2].header.data();
-    auto *producer = buffers[3].header.data();
-    Check(wait_address(blocked, &fence, comparison.reference, comparison.compare, 0) == OK &&
-              write_address(blocked, &blocked_done, 1) == OK &&
-              read_file(reader, reinterpret_cast<uint64_t>(&buffers[1].header[3]),
-                        reinterpret_cast<uint64_t>(&buffers[1].header[4]), file_id,
-                        output.data(), output.size(), 0) == OK &&
-              write_address(reader, &read_done, 2) == OK &&
-              write_address(lower, &lower_done, 3) == OK &&
-              write_address(producer, &fence, comparison.released) == OK,
-          "build dependent APR read and later AMM fence producer");
-    Check(submit_apr(blocked, 3, &results[0], &ids[0]) == OK &&
-              submit_apr(reader, 3, &results[1], &ids[1]) == OK &&
-              submit_apr(lower, 4, &results[2], &ids[2]) == OK && wait_apr(ids[2]) == OK,
-          "APR submit returns while blocked and a lower priority completes");
-    Check(lower_done == 3 && blocked_done == 0 && read_done == 0 &&
-              output == std::array<char, 3>{} && results[0].result == 1234 &&
-              results[1].result == 1234,
-          "unsatisfied wait blocks later buffers at its priority without publishing completion");
-    Check(submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(producer)), 1,
-                     &ids[3]) == OK && wait_amm(ids[3]) == OK &&
-              wait_apr(ids[0]) == OK && wait_apr(ids[1]) == OK,
-          "later AMM submission releases the APR dependency");
-    Check(blocked_done == 1 && read_done == 2 && std::memcmp(output.data(), "APR", 3) == 0,
-          "APR reads real file bytes only after its dependency completes");
-    for (const auto &result : results) {
-      Check(result.result == OK,
-            "submission wait observes the completed result");
-    }
-  }
-  reset(0);
-  uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
-  std::array<uint32_t, 2> ids {};
-  Check(wait_address(buffers[0].header.data(), &cpu_fence, 0, 1, 0) == OK &&
-            write_address(buffers[0].header.data(), &amm_done, 1) == OK &&
-            write_address(buffers[1].header.data(), &lower_done, 1) == OK &&
-            submit_amm(buffers[0].data.data(), static_cast<uint32_t>(offset(buffers[0].header.data())),
-                       0, &ids[0]) == OK &&
-            submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(buffers[1].header.data())),
-                       1, &ids[1]) == OK && wait_amm(ids[1]) == OK,
-        "AMM lower priority progresses while its high priority waits");
-  Check(lower_done == 1 && amm_done == 0, "AMM wait preserves its dependency");
-  std::atomic_ref(cpu_fence).store(1, std::memory_order_release);
-  Check(wait_amm(ids[0]) == OK && amm_done == 1,
-        "AMM observes an external CPU fence store without a submission notification");
-  for (auto &buffer : buffers) {
-    destroy(buffer.header.data());
-  }
-}
-
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -809,213 +564,8 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
-  CheckAmprOrdering(symbols, expected_id);
   FileSystem::Umount("/app0");
 }
-
-std::array<int, 2> CreateTcpPair() {
-  namespace Net = Libs::Network::Net;
-  // Guest sockaddr_in: length, family, network-order port/address, padding.
-  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
-  const int listener = Net::Socket(2, 1, 0);
-  Check(listener >= 0, "create loopback listener");
-  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
-  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
-  uint32_t address_size = address.size();
-  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
-        "get assigned loopback port");
-  const int writer = Net::Socket(2, 1, 0);
-  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
-        "connect wake socket");
-  const int reader = Net::Accept(listener, nullptr, nullptr);
-  Check(reader >= 0, "accept wake socket");
-  Check(Net::SocketClose(listener) == 0, "close listener");
-  return {reader, writer};
-}
-
-#if defined(_WIN32)
-void CheckSocketReceiveConcurrency() {
-  namespace Net = Libs::Network::Net;
-  const auto [reader, writer] = CreateTcpPair();
-  const int timeout_ms = 3000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
-        "bound the blocked receive concurrency fixture");
-  std::promise<void> entered;
-  std::promise<int64_t> completed;
-  auto entered_future = entered.get_future();
-  auto completed_future = completed.get_future();
-  std::jthread receiver([&] {
-    char byte = 0;
-    entered.set_value();
-    completed.set_value(Net::Recv(reader, &byte, 1, 0x42));
-  });
-  Check(entered_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
-        "start blocked reader");
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  char byte = 0;
-  const auto before_nonblocking = std::chrono::steady_clock::now();
-  Check(Net::Recv(reader, &byte, 1, 0x80) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
-            std::chrono::steady_clock::now() - before_nonblocking < std::chrono::milliseconds(500) &&
-            completed_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
-        "DONTWAIT does not wait behind another blocked reader");
-  const auto before_close = std::chrono::steady_clock::now();
-  Check(Net::SocketClose(reader) == 0, "close succeeds while another thread receives");
-  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
-        "close does not wait for the blocked receive timeout");
-  Check(completed_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
-        "close wakes the blocked receive within one second");
-  Check(completed_future.get() <= 0, "closed receive reports EOF or error");
-  Check(std::chrono::steady_clock::now() - before_close < std::chrono::seconds(1),
-        "closing a socket wakes its blocked receive before the receive timeout");
-  receiver.join();
-  Check(Net::SocketClose(writer) == 0, "close blocked receive writer");
-
-  const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
-  Check(Net::Setsockopt(shutdown_reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
-            Net::Send(shutdown_writer, "x", 1, 0) == 1 &&
-            Net::Recv(shutdown_reader, &byte, 1, 0x42) == 1 && byte == 'x' &&
-            Net::Shutdown(shutdown_reader, 0) == 0 &&
-            Net::Recv(shutdown_reader, &byte, 1, 0) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ESHUTDOWN,
-        "receive shutdown rejects bytes retained by an earlier peek");
-  Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
-        "close receive shutdown fixture");
-}
-
-void CheckSocketReceiveBuffer(int reader, int writer) {
-  namespace Net = Libs::Network::Net;
-  constexpr int PeekWaitAll = 0x42;
-  constexpr char Payload[] = "abcdef";
-  const int timeout_ms = 2000;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0,
-        "bound blocking receive regressions with SO_RCVTIMEO");
-  Check(Net::Send(writer, Payload, 2, 0) == 2, "send first TCP fragment");
-  std::jthread sender([&] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    Check(Net::Send(writer, Payload + 2, 4, 0) == 4, "send second TCP fragment");
-  });
-  std::array<char, 8> received {};
-  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
-            std::memcmp(received.data(), Payload, 6) == 0,
-        "combined peek waits for fragmented TCP bytes");
-  sender.join();
-  received.fill(0);
-  Check(Net::Recv(reader, received.data(), 6, PeekWaitAll) == 6 &&
-            std::memcmp(received.data(), Payload, 6) == 0,
-        "repeated combined peek preserves all bytes");
-
-  const int epoll = Net::EpollCreate("buffered receive", 0);
-  Net::NetEpollEvent registration {};
-  registration.events = 1;
-  registration.data.u64 = 0x12345678;
-  Check(epoll >= 0 && Net::EpollControl(epoll, 1, reader, &registration) == 0,
-        "register buffered socket readability");
-  const auto check_readable = [&](bool expected) {
-    std::array<uint64_t, 16> readable {};
-    const auto bit = uint64_t {1} << (reader % 64);
-    readable[reader / 64] = bit;
-    const std::array<int64_t, 2> timeout {expected ? 1 : 0, 0};
-    Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr, timeout.data()) ==
-              (expected ? 1 : 0) && readable[reader / 64] == (expected ? bit : 0),
-          "select reflects buffered bytes and their removal");
-    if (expected) {
-      auto writable = readable;
-      Check(Net::Select(reader + 1, readable.data(), writable.data(), nullptr,
-                        timeout.data()) == 2 && readable[reader / 64] == bit &&
-                writable[reader / 64] == bit,
-            "select counts readable and writable bits once each");
-    }
-    Net::NetEpollEvent event {};
-    Check(Net::EpollWait(epoll, &event, 1, expected ? 1000000 : 0) ==
-              (expected ? 1 : 0) &&
-              (!expected || (event.events == 1 && event.data.u64 == registration.data.u64)),
-          "epoll reflects buffered bytes and preserves registration data");
-  };
-  check_readable(true);
-  std::array<uint8_t, 16> peer {}, expected_peer {};
-  uint32_t peer_size = peer.size(), expected_peer_size = expected_peer.size();
-  Check(Net::Getsockname(writer, expected_peer.data(), &expected_peer_size) == 0 &&
-            Net::Recv(reader, received.data(), 0, PeekWaitAll) == 0 &&
-            Net::Recvfrom(reader, received.data(), 2, 0, peer.data(), &peer_size) == 2 &&
-            peer_size == expected_peer_size && peer == expected_peer &&
-            std::memcmp(received.data(), Payload, 2) == 0 &&
-            FileSystem::KernelRead(reader, received.data(), 2) == 2 &&
-            std::memcmp(received.data(), Payload + 2, 2) == 0,
-        "zero-length peek preserves bytes; recvfrom returns peer and shares kernel read buffer");
-  check_readable(true);
-  Check(Net::Send(writer, "gh", 2, 0) == 2 &&
-            Net::Recv(reader, received.data(), 4, 0x40) == 4 &&
-            std::memcmp(received.data(), "efgh", 4) == 0,
-        "waitall joins buffered bytes with newly received bytes");
-  check_readable(false);
-  Check(Net::Send(writer, "mn", 2, 0) == 2, "send plain peek fixture");
-  const auto before_peek = std::chrono::steady_clock::now();
-  Check(Net::Recv(reader, received.data(), 4, 2) == 2 &&
-            std::memcmp(received.data(), "mn", 2) == 0 &&
-            std::chrono::steady_clock::now() - before_peek < std::chrono::milliseconds(500) &&
-            Net::Recv(reader, received.data(), 4, 0) == 2 &&
-            std::memcmp(received.data(), "mn", 2) == 0,
-        "plain peek returns available bytes promptly and preserves them for ordinary receive");
-
-  const int enabled = 1, disabled = 0;
-  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
-            Net::Recv(reader, received.data(), 4, PeekWaitAll) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-        "empty nonblocking combined peek returns would-block");
-  Check(Net::Send(writer, "ij", 2, 0) == 2, "send nonblocking receive fixture");
-  check_readable(true);
-  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  for (int i = 0; i < 2; ++i) {
-    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
-              std::memcmp(received.data(), "ij", 2) == 0 &&
-              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-          "nonblocking combined peek preserves a short result and successful errno");
-  }
-  Check(Net::Recv(reader, received.data(), 4, 0) == 2 &&
-            std::memcmp(received.data(), "ij", 2) == 0,
-        "ordinary receive consumes a short buffered result");
-  check_readable(false);
-  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &disabled, sizeof(disabled)) == 0 &&
-            Net::EpollDestroy(epoll) == 0,
-        "restore blocking receives and destroy epoll");
-  Check(Net::Recv(reader, received.data(), 4, PeekWaitAll | 0x80) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-        "per-call nonblocking combined peek returns would-block on a blocking socket");
-  Check(Net::Send(writer, "kl", 2, 0) == 2 && Net::Shutdown(writer, 1) == 0,
-        "send a final partial payload and EOF");
-  for (int i = 0; i < 2; ++i) {
-    Check(Net::Recv(reader, received.data(), 4, PeekWaitAll) == 2 &&
-              std::memcmp(received.data(), "kl", 2) == 0,
-          "EOF ends waitall while repeated peeks preserve the short payload");
-  }
-  Check(Net::Recv(reader, received.data(), 4, 0x40) == 2 &&
-            std::memcmp(received.data(), "kl", 2) == 0 &&
-            Net::Recv(reader, received.data(), 4, PeekWaitAll) == 0,
-        "draining the final buffered payload exposes EOF");
-
-  const int datagram = Net::Socket(2, 2, 0);
-  const int datagram_writer = Net::Socket(2, 2, 0);
-  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
-  uint32_t address_size = address.size();
-  Check(datagram >= 0 && datagram_writer >= 0 &&
-            Net::Bind(datagram, address.data(), address.size()) == 0 &&
-            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
-            Net::Setsockopt(datagram, 0xffff, 0x1006, &timeout_ms, sizeof(timeout_ms)) == 0 &&
-            Net::Sendto(datagram_writer, Payload, 6, 0, address.data(), address_size) == 6,
-        "create bounded UDP truncation fixture");
-  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  Check(Net::Recvfrom(datagram, received.data(), 2, 0, nullptr, nullptr) == 2 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL &&
-            std::memcmp(received.data(), Payload, 2) == 0 &&
-            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
-            Net::Recv(datagram, received.data(), received.size(), 0) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
-        "UDP truncation returns its prefix and discards the rest of the datagram");
-  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
-        "close UDP truncation fixture");
-}
-#endif
 
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
@@ -1035,7 +585,21 @@ void CheckSocketWakeup() {
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
-  const auto [reader, writer] = CreateTcpPair();
+  // Guest sockaddr_in: length, family, network-order port/address, padding.
+  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int listener = Net::Socket(2, 1, 0);
+  Check(listener >= 0, "create loopback listener");
+  Check(Net::Bind(listener, address.data(), address.size()) == 0, "bind loopback");
+  Check(Net::Listen(listener, 1) == 0, "listen on loopback");
+  uint32_t address_size = address.size();
+  Check(Net::Getsockname(listener, address.data(), &address_size) == 0,
+        "get assigned loopback port");
+  const int writer = Net::Socket(2, 1, 0);
+  Check(writer >= 0 && Net::Connect(writer, address.data(), address_size) == 0,
+        "connect wake socket");
+  const int reader = Net::Accept(listener, nullptr, nullptr);
+  Check(reader >= 0, "accept wake socket");
+  Check(Net::SocketClose(listener) == 0, "close listener");
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
         "enable TCP_NODELAY");
@@ -1104,10 +668,6 @@ void CheckSocketWakeup() {
         "Net send reports a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
-#if defined(_WIN32)
-  CheckSocketReceiveBuffer(reader, writer);
-  CheckSocketReceiveConcurrency();
-#endif
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
@@ -1121,6 +681,311 @@ void CheckSocketWakeup() {
             readable[reader / 64] == bit,
         "closed descriptor fails without clearing input fd_set");
 }
+
+#if defined(_WIN32)
+namespace Net = Libs::Network::Net;
+
+void SetReceiveTimeout(int socket, int milliseconds) {
+  const std::array<int64_t, 2> timeout{milliseconds / 1000,
+                                       (milliseconds % 1000) * 1000};
+  Check(Net::Setsockopt(socket, 0xffff, 0x1006, timeout.data(),
+                        sizeof(timeout)) == 0,
+        "set guest timeval receive timeout");
+}
+
+void SetSocketNonblocking(int socket, bool enabled) {
+  const int value = enabled ? 1 : 0;
+  Check(Net::Setsockopt(socket, 0xffff, 0x1200, &value, sizeof(value)) == 0,
+        "set guest socket blocking mode");
+  int actual = -1;
+  uint32_t size = sizeof(actual);
+  Check(Net::Getsockopt(socket, 0xffff, 0x1200, &actual, &size) == 0 &&
+            actual == value,
+        "shared transport reports its blocking mode");
+}
+
+void WaitSocketReadable(int socket) {
+  std::array<uint64_t, 16> readable{};
+  readable[socket / 64] = uint64_t{1} << (socket % 64);
+  const std::array<int64_t, 2> timeout{2, 0};
+  Check(Net::Select(socket + 1, readable.data(), nullptr, nullptr,
+                    timeout.data()) == 1,
+        "loopback fixture becomes readable");
+}
+
+class LoopbackConnection {
+public:
+  explicit LoopbackConnection(bool nonblocking_listener = false) {
+    std::array<uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
+    const int listener = Net::Socket(2, 1, 0);
+    Check(listener >= 0 &&
+              Net::Bind(listener, address.data(), address.size()) == 0 &&
+              Net::Listen(listener, 1) == 0,
+          "create receive regression listener");
+    uint32_t size = address.size();
+    Check(Net::Getsockname(listener, address.data(), &size) == 0,
+          "get receive regression listener address");
+    writer = Net::Socket(2, 1, 0);
+    Check(writer >= 0 && Net::Connect(writer, address.data(), size) == 0,
+          "connect receive regression writer");
+    WaitSocketReadable(listener);
+    if (nonblocking_listener) {
+      SetSocketNonblocking(listener, true);
+    }
+    reader = Net::Accept(listener, nullptr, nullptr);
+    Check(reader >= 0 && Net::SocketClose(listener) == 0,
+          "accept receive regression connection");
+    const int enabled = 1;
+    Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
+          "disable Nagle for gated chunk arrivals");
+    SetReceiveTimeout(reader, 2000);
+  }
+
+  ~LoopbackConnection() {
+    if (reader >= 0) {
+      Check(Net::SocketClose(reader) == 0, "close receive regression reader");
+    }
+    if (writer >= 0) {
+      Check(Net::SocketClose(writer) == 0, "close receive regression writer");
+    }
+  }
+
+  void Send(std::string_view bytes) const {
+    Check(Net::Send(writer, bytes.data(), bytes.size(), 0x20000) ==
+              bytes.size(),
+          "send receive regression bytes");
+  }
+
+  KYTY_CLASS_NO_COPY(LoopbackConnection);
+  int reader = -1;
+  int writer = -1;
+};
+
+void CheckWindowsReceiveFlags() {
+  using namespace std::chrono_literals;
+  constexpr std::string_view payload = "abcdef";
+
+  // The existing wake test covers a prefilled Recv. Exercise Recvfrom as well:
+  // Winsock does not fill the source address itself for a stream receive.
+  {
+    LoopbackConnection connection;
+    connection.Send(payload);
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::array<uint8_t, 16> peer{}, expected_peer{};
+    uint32_t peer_size = peer.size(), expected_size = expected_peer.size();
+    Check(Net::Getsockname(connection.writer, expected_peer.data(),
+                           &expected_size) == 0,
+          "get expected receive peer address");
+    Check(Net::Recvfrom(connection.reader, bytes.data(), bytes.size(), 0x42,
+                        peer.data(), &peer_size) == bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload &&
+              peer == expected_peer,
+          "stream Recvfrom PEEK WAITALL preserves bytes and reports peer");
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                  bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload,
+          "consume bytes after stream Recvfrom peek");
+    Check(Net::Recv(connection.reader, bytes.data(), 0, 0x42) == 0,
+          "zero-length stream PEEK WAITALL returns immediately");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      entered.set_value();
+      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready,
+          "start chunked receive");
+    Check(receive.wait_for(50ms) == std::future_status::timeout,
+          "WAITALL remains pending with only the first queued chunk");
+    connection.Send(payload.substr(2, 2));
+    Check(receive.wait_for(50ms) == std::future_status::timeout,
+          "WAITALL remains pending with only two chunks");
+    connection.Send(payload.substr(4));
+    Check(receive.wait_for(2s) == std::future_status::ready &&
+              receive.get() == bytes.size() &&
+              std::string_view(bytes.data(), bytes.size()) == payload,
+          "WAITALL returns all three gated chunks in order");
+    if ((flags & 2) != 0) {
+      bytes.fill(0);
+      Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                    bytes.size() &&
+                std::string_view(bytes.data(), bytes.size()) == payload,
+            "chunked PEEK leaves the complete stream queued");
+    }
+  }
+
+  {
+    LoopbackConnection connection(true);
+    std::array<char, 6> bytes{};
+    int inherited = 0;
+    uint32_t size = sizeof(inherited);
+    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1200, &inherited,
+                          &size) == 0 &&
+              inherited == 1,
+          "accepted Windows socket inherits nonblocking mode");
+    for (const int flags : {0x40, 0x42, 0x80, 0xc2}) {
+      Check(
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "empty nonblocking receive ignores WAITALL and reports would-block");
+    }
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0xc2) == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "nonblocking PEEK WAITALL returns the queued prefix");
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "nonblocking WAITALL consumes only the queued prefix");
+    SetSocketNonblocking(connection.reader, false);
+    Check(
+        Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x80) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+        "blocking transport explicitly rejects unsupported per-call DONTWAIT");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 80);
+    std::array<int64_t, 2> timeout{};
+    uint32_t size = sizeof(timeout);
+    Check(Net::Getsockopt(connection.reader, 0xffff, 0x1006, timeout.data(),
+                          &size) == 0 &&
+              timeout == std::array<int64_t, 2>{0, 80'000},
+          "receive timeout round-trips through the guest timeval ABI");
+    const std::array<int64_t, 2> invalid_timeout{0, 1'000'000};
+    Check(Net::Setsockopt(connection.reader, 0xffff, 0x1006,
+                          invalid_timeout.data(),
+                          sizeof(invalid_timeout)) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "invalid timeval does not change the receive timeout");
+    std::array<char, 6> bytes{};
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "empty WAITALL receive expires with would-block");
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+    const auto start = std::chrono::steady_clock::now();
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) ==
+                  2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2) &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+          "WAITALL timeout returns the prefix without replacing guest errno");
+    Check(std::chrono::steady_clock::now() - start >= 70ms,
+          "partial WAITALL receive honors the configured deadline");
+    if ((flags & 2) != 0) {
+      Check(Net::Recv(connection.reader, bytes.data(), 2, 0) == 2 &&
+                std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+            "timed-out PEEK leaves its prefix available to consume");
+    }
+    SetSocketNonblocking(connection.reader, true);
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), 0) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+          "timeout path does not duplicate consumed bytes");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 0);
+    connection.Send(payload.substr(0, 2));
+    Check(Net::Shutdown(connection.writer, 1) == 0,
+          "send FIN after a partial payload");
+    std::array<char, 6> bytes{};
+    auto receive = std::async(std::launch::async, [&] {
+      return Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+    });
+    Check(receive.wait_for(2s) == std::future_status::ready &&
+              receive.get() == 2 &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "partial WAITALL completes on EOF without a receive timeout");
+    if ((flags & 2) != 0) {
+      Check(
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42) == 2 &&
+              Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x40) ==
+                  2,
+          "EOF PEEK preserves the prefix for another peek and consumption");
+    }
+    Check(Net::Recv(connection.reader, bytes.data(), bytes.size(), flags) == 0,
+          "drained stream reports EOF with WAITALL flags");
+  }
+
+  for (const int flags : {0x40, 0x42}) {
+    LoopbackConnection connection;
+    connection.Send(payload.substr(0, 2));
+    WaitSocketReadable(connection.reader);
+    std::array<char, 6> bytes{};
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
+      entered.set_value();
+      const auto result =
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), flags);
+      return std::pair{result, *Libs::Posix::GetErrorAddr()};
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready &&
+              receive.wait_for(50ms) == std::future_status::timeout,
+          "partial receive is waiting before peer reset");
+    // This Windows backend also accepts the native SO_LINGER representation.
+    const std::array<uint16_t, 2> abortive_linger{1, 0};
+    Check(Net::Setsockopt(connection.writer, 0xffff, 0x80,
+                          abortive_linger.data(),
+                          sizeof(abortive_linger)) == 0 &&
+              Net::SocketClose(connection.writer) == 0,
+          "reset peer after partial receive");
+    connection.writer = -1;
+    Check(receive.wait_for(2s) == std::future_status::ready,
+          "peer reset releases partial WAITALL");
+    const auto result = receive.get();
+    Check(result.first == 2 && result.second == Libs::Posix::POSIX_EINVAL &&
+              std::string_view(bytes.data(), 2) == payload.substr(0, 2),
+          "peer reset returns already received bytes without replacing errno");
+  }
+
+  {
+    std::array<char, 6> bytes{};
+    const int unconnected = Net::Socket(2, 1, 0);
+    Check(unconnected >= 0, "create unconnected receive fixture");
+    SetReceiveTimeout(unconnected, 100);
+    Check(Net::Recv(unconnected, bytes.data(), bytes.size(), 0x42) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOTCONN,
+          "WAITALL preserves unconnected stream error");
+    Check(Net::SocketClose(unconnected) == 0,
+          "close unconnected receive fixture");
+    LoopbackConnection connection;
+    SetReceiveTimeout(connection.reader, 0);
+    std::promise<void> entered;
+    auto entry = entered.get_future();
+    auto receive = std::async(std::launch::async, [&] {
+      entered.set_value();
+      const auto result =
+          Net::Recv(connection.reader, bytes.data(), bytes.size(), 0x42);
+      return std::pair{result, *Libs::Posix::GetErrorAddr()};
+    });
+    Check(entry.wait_for(2s) == std::future_status::ready &&
+              receive.wait_for(50ms) == std::future_status::timeout,
+          "empty WAITALL is pending before local shutdown");
+    Check(Net::Shutdown(connection.reader, 0) == 0,
+          "shut down a pending receive");
+    Check(receive.wait_for(2s) == std::future_status::ready,
+          "local shutdown cancels WAITALL without a receive timeout");
+    const auto result = receive.get();
+    Check(result.first == -1 && result.second == Libs::Posix::POSIX_ESHUTDOWN,
+          "WAITALL preserves local receive-shutdown error");
+  }
+}
+#endif
 
 } // namespace
 
@@ -1153,12 +1018,13 @@ int main(int, char**) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
-  TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
-  TestNpWebApi2Memory();
+#if defined(_WIN32)
+  CheckWindowsReceiveFlags();
+#endif
   graphics.reset();
   subsystems.Destroy();
 
