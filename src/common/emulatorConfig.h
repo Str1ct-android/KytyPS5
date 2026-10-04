@@ -83,12 +83,12 @@ struct ConfigOptions {
 	bool                   dcc_gpu_clear_enabled       = true;
 	bool                   async_submit_enabled        = true;
 	bool                   gpu_mesh_indirect_enabled   = true;
-	uint32_t               gpu_frames_ahead            = 0;
+	uint32_t               gpu_frames_ahead            = 2;
 	uint32_t               label_flush_interval_us     = 2000;
-	uint32_t               gpu_timestamp_scale_percent = 100;
+	uint32_t               gpu_timestamp_scale_percent = 115;
 	bool                   pipeline_libraries_enabled  = true;
-	bool                   async_pipelines_enabled     = false;
-	bool                   relaxed_readback_enabled    = false;
+	bool                   async_pipelines_enabled     = true;
+	bool                   relaxed_readback_enabled    = true;
 	bool                   speculative_draws_enabled   = true;
 	bool                   record_thread_enabled       = true;
 	bool                   hardware_buffer_bounds      = true;
